@@ -3,6 +3,7 @@
 Library logging untuk Go dengan dukungan error, success, warning, dan info logging. Library ini menyediakan logging dengan informasi lengkap termasuk timestamp, UUID v7, hostname, IP address, method, routing, dan semua field mandatory untuk production logging.
 
 **Fitur Utama:**
+- ✅ **Asynchronous Logging** - Non-blocking, high-performance logging dengan goroutine dan channel
 - ✅ Support multiple web framework (Gin, Echo, Fiber, standard HTTP, dll)
 - ✅ Auto-extract method dan routing dari HTTP request
 - ✅ Built-in middleware untuk standard HTTP
@@ -11,10 +12,11 @@ Library logging untuk Go dengan dukungan error, success, warning, dan info loggi
 
 ## Fitur
 
+- ✅ **Asynchronous Logging**: Non-blocking logging dengan goroutine dan buffered channel (kapasitas 1000). Semua operasi logging tidak menghambat eksekusi kode utama, meningkatkan performa aplikasi secara signifikan.
 - ✅ **Multiple Log Levels**: Error, Success, Warning, dan Info
 - ✅ **UUID v7 Support**: Tracking setiap request/session dengan UUID v7 (time-based) menggunakan `github.com/google/uuid`
 - ✅ **Context Support**: Integrasi dengan `context.Context` untuk request tracing
-- ✅ **Rich Information**: Timestamp, hostname, IP address, file, line, dan function name
+- ✅ **Rich Information**: Timestamp, hostname, IP address, file, line, dan function name (caller info di-capture saat pemanggilan, bukan di worker)
 - ✅ **Color Output**: Warna berbeda untuk setiap level di console (dengan warna) dan file (tanpa warna)
 - ✅ **File Logging**: Optional logging ke file dengan config terpisah
 - ✅ **Formatted Messages**: Support untuk formatted messages (Printf style)
@@ -22,6 +24,8 @@ Library logging untuk Go dengan dukungan error, success, warning, dan info loggi
 - ✅ **Multi-Framework Support**: Bisa digunakan dengan berbagai web framework (Gin, Echo, Fiber, standard HTTP, dll) melalui interface `HTTPRequestInfo`
 - ✅ **Built-in Middleware**: Middleware siap pakai untuk standard HTTP
 - ✅ **Mandatory Fields**: Support semua field mandatory (timestamp, level, transaction ID, service name, endpoint, method, execution time, server IP, trace ID, body, flag, message)
+- ✅ **Thread-Safe**: Aman digunakan dari multiple goroutines secara bersamaan
+- ✅ **Graceful Shutdown**: `Close()` method akan flush semua log yang tersisa sebelum shutdown
 
 ## Instalasi
 
@@ -43,17 +47,18 @@ import (
 func main() {
     // Buat config untuk logger
     config := &logger.LoggerConfig{
-        LogFile: "app.log",           // Path ke file log (required jika Type = "file" atau "all")
-        Type:    logger.LogTypeAll,   // Type: "console", "file", atau "all"
+        LogFile:    "app.log",           // Path ke file log (required jika Type = "file" atau "all")
+        Type:       logger.LogTypeAll,   // Type: "console", "file", atau "all"
+        BufferSize: 1000,                // Buffer size untuk async channel (default: 1000, optional)
     }
 
     appLogger, err := logger.StartLogger(config)
     if err != nil {
         panic(err)
     }
-    defer appLogger.Close()
+    defer appLogger.Close() // Penting: selalu panggil Close() untuk flush semua log yang tersisa
 
-    // Gunakan logger
+    // Gunakan logger (semua method non-blocking)
     appLogger.Success("Aplikasi berhasil dimulai")
     appLogger.Info("Sistem logging telah diinisialisasi")
 }
@@ -117,8 +122,9 @@ var appLogger *logger.Logger
 
 func init() {
     config := &logger.LoggerConfig{
-        LogFile: "app.log",
-        Type:    logger.LogTypeAll, // Console + File
+        LogFile:    "app.log",
+        Type:       logger.LogTypeAll, // Console + File
+        BufferSize: 1000,              // Default buffer size (optional)
     }
     var err error
     appLogger, err = logger.StartLogger(config)
@@ -173,8 +179,9 @@ func main() {
 
 ```go
 config := &logger.LoggerConfig{
-    LogFile: "app.log",           // Path ke file log (required jika Type = "file" atau "all")
-    Type:    logger.LogTypeAll,   // Type: "console", "file", atau "all"
+    LogFile:    "app.log",           // Path ke file log (required jika Type = "file" atau "all")
+    Type:       logger.LogTypeAll,   // Type: "console", "file", atau "all"
+    BufferSize: 1000,                // Buffer size untuk async logging channel (default: 1000, optional)
 }
 ```
 
@@ -183,25 +190,37 @@ config := &logger.LoggerConfig{
 - **`logger.LogTypeFile`** atau **`"file"`** - Hanya file (tanpa warna, plain text), tidak ditampilkan di console
 - **`logger.LogTypeAll`** atau **`"all"`** - Console + File (console dengan warna, file tanpa warna) - **Recommended**
 
+**Field Options:**
+- **`LogFile`** (string, optional) - Path ke file log. Required jika `Type = "file"` atau `"all"`
+- **`Type`** (LogType, required) - Type logging: `"console"`, `"file"`, atau `"all"`
+- **`BufferSize`** (int, optional) - Buffer size untuk async logging channel. Default: `1000`. Semakin besar buffer, semakin banyak log yang bisa di-queue sebelum blocking. Untuk high-traffic aplikasi, bisa di-set lebih besar (misalnya 5000 atau 10000).
+
 **Contoh:**
 ```go
-// Console saja
+// Console saja (default buffer size: 1000)
 config := &logger.LoggerConfig{
     Type: logger.LogTypeConsole, // atau "console"
 }
 
-// File saja
+// File saja dengan custom buffer size
 config := &logger.LoggerConfig{
-    LogFile: "app.log",
-    Type:    logger.LogTypeFile, // atau "file"
+    LogFile:    "app.log",
+    Type:       logger.LogTypeFile, // atau "file"
+    BufferSize: 5000,                // Custom buffer size untuk high-traffic
 }
 
-// Console + File (Recommended)
+// Console + File (Recommended) dengan custom buffer size
 config := &logger.LoggerConfig{
-    LogFile: "app.log",
-    Type:    logger.LogTypeAll, // atau "all"
+    LogFile:    "app.log",
+    Type:       logger.LogTypeAll, // atau "all"
+    BufferSize: 2000,              // Custom buffer size
 }
 ```
+
+**Tips Buffer Size:**
+- **Default (1000)**: Cocok untuk sebagian besar aplikasi
+- **5000-10000**: Untuk aplikasi dengan traffic tinggi atau banyak concurrent requests
+- **< 100**: Tidak disarankan, bisa menyebabkan log di-drop jika channel penuh
 
 ### Backward Compatibility:
 
@@ -291,6 +310,46 @@ appLogger, err := logger.NewLoggerSimple("")        // Console only
 
 **Note:** Console menampilkan dengan warna, file ditulis tanpa warna (plain text) untuk memudahkan parsing.
 
+## Asynchronous Logging
+
+Logger menggunakan **asynchronous logging** dengan goroutine dan buffered channel untuk performa optimal:
+
+### Keuntungan:
+- **Non-blocking**: Semua method logging (`Error()`, `Warning()`, `Success()`, `Info()`, dll) langsung return tanpa menunggu I/O selesai
+- **High Performance**: Operasi I/O (console/file) dilakukan di background, tidak menghambat eksekusi kode utama
+- **Thread-Safe**: Aman digunakan dari multiple goroutines secara bersamaan
+- **Buffered Channel**: Channel dengan kapasitas configurable (default: 1000) untuk menampung log messages. Bisa di-set melalui `LoggerConfig.BufferSize`
+- **Graceful Shutdown**: `Close()` method akan menunggu semua log yang tersisa diproses sebelum shutdown
+
+### Cara Kerja:
+1. Saat memanggil method logging (misalnya `log.Success("message")`):
+   - Caller info (file, line, function) di-capture saat pemanggilan
+   - Log message dibuat dan dikirim ke buffered channel (non-blocking)
+   - Method langsung return, tidak menunggu log ditulis
+
+2. Worker goroutine (background):
+   - Membaca log messages dari channel
+   - Memformat dan menulis ke console/file
+   - Menangani shutdown dengan flush semua log yang tersisa
+
+### Contoh:
+```go
+// Semua method ini non-blocking dan langsung return
+appLogger.Success("Aplikasi berhasil dimulai")
+appLogger.Info("Sistem logging telah diinisialisasi")
+appLogger.Warning("Peringatan")
+appLogger.Error("Error terjadi")
+
+// Logging tidak menghambat eksekusi kode berikutnya
+doSomethingImportant() // Akan langsung dieksekusi, tidak menunggu log selesai
+```
+
+### Important Notes:
+- **Selalu panggil `defer logger.Close()`** untuk memastikan semua log ter-flush sebelum aplikasi exit
+- Jika channel penuh (sangat jarang terjadi), log akan di-drop dan error message akan ditampilkan ke stderr
+- Caller info (file, line, function) di-capture saat pemanggilan method, bukan di worker goroutine, sehingga selalu akurat
+- **Buffer Size**: Default adalah 1000. Untuk aplikasi dengan traffic tinggi, bisa di-set lebih besar melalui `LoggerConfig.BufferSize` (misalnya 5000 atau 10000)
+
 ## Contoh Penggunaan Lengkap
 
 ### 1. Standard HTTP dengan Built-in Middleware (Recommended)
@@ -307,8 +366,9 @@ var appLogger *logger.Logger
 
 func init() {
     config := &logger.LoggerConfig{
-        LogFile: "app.log",
-        Type:    logger.LogTypeAll, // Console + File
+        LogFile:    "app.log",
+        Type:       logger.LogTypeAll, // Console + File
+        BufferSize: 1000,              // Default buffer size (optional)
     }
     var err error
     appLogger, err = logger.StartLogger(config)
@@ -354,8 +414,9 @@ var appLogger *logger.Logger
 
 func init() {
     config := &logger.LoggerConfig{
-        LogFile: "app.log",
-        Type:    logger.LogTypeAll, // Console + File
+        LogFile:    "app.log",
+        Type:       logger.LogTypeAll, // Console + File
+        BufferSize: 1000,              // Default buffer size (optional)
     }
     var err error
     appLogger, err = logger.StartLogger(config)
@@ -423,8 +484,9 @@ var appLogger *logger.Logger
 
 func init() {
     config := &logger.LoggerConfig{
-        LogFile: "app.log",
-        Type:    logger.LogTypeAll, // Console + File
+        LogFile:    "app.log",
+        Type:       logger.LogTypeAll, // Console + File
+        BufferSize: 1000,              // Default buffer size (optional)
     }
     var err error
     appLogger, err = logger.StartLogger(config)
@@ -504,8 +566,9 @@ var appLogger *logger.Logger
 
 func init() {
     config := &logger.LoggerConfig{
-        LogFile: "app.log",
-        Type:    logger.LogTypeAll, // Console + File
+        LogFile:    "app.log",
+        Type:       logger.LogTypeAll, // Console + File
+        BufferSize: 1000,              // Default buffer size (optional)
     }
     var err error
     appLogger, err = logger.StartLogger(config)
@@ -600,8 +663,9 @@ var appLogger *logger.Logger
 
 func init() {
     config := &logger.LoggerConfig{
-        LogFile: "app.log",
-        Type:    logger.LogTypeAll, // Console + File
+        LogFile:    "app.log",
+        Type:       logger.LogTypeAll, // Console + File
+        BufferSize: 1000,              // Default buffer size (optional)
     }
     var err error
     appLogger, err = logger.StartLogger(config)
@@ -661,6 +725,42 @@ Semua field berikut akan otomatis diisi dalam setiap log entry:
 12. **Message** - Pesan log
 
 **Catatan:** Field yang tidak disediakan akan menggunakan nilai default atau di-generate otomatis.
+
+## Performance & Best Practices
+
+### Asynchronous Logging
+- Semua method logging adalah **non-blocking** dan langsung return
+- Operasi I/O dilakukan di background worker goroutine
+- Channel buffered dengan kapasitas 1000 untuk menampung log messages
+- Jika channel penuh (sangat jarang), log akan di-drop dengan error message ke stderr
+
+### Best Practices:
+1. **Selalu panggil `defer logger.Close()`** untuk memastikan semua log ter-flush sebelum aplikasi exit
+2. **Jangan membuat multiple logger instance** untuk aplikasi yang sama (gunakan singleton pattern)
+3. **Gunakan context** untuk tracking request yang sama dengan UUID yang sama
+4. **Gunakan middleware** untuk automatic START/STOP logging pada HTTP requests
+
+### Contoh Pattern yang Disarankan:
+```go
+var appLogger *logger.Logger
+
+func init() {
+    config := &logger.LoggerConfig{
+        LogFile: "app.log",
+        Type:    logger.LogTypeAll,
+    }
+    var err error
+    appLogger, err = logger.StartLogger(config)
+    if err != nil {
+        panic(err)
+    }
+}
+
+func main() {
+    defer appLogger.Close() // Penting!
+    // ... rest of your code
+}
+```
 
 ## License
 

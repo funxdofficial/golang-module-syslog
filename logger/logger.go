@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -93,8 +94,23 @@ const (
 
 // LoggerConfig represents configuration for creating a logger instance
 type LoggerConfig struct {
-	LogFile string  // Path to log file (required jika Type = "file" atau "all")
-	Type    LogType // Type of logging: "console", "file", atau "all"
+	LogFile    string  // Path to log file (required jika Type = "file" atau "all")
+	Type       LogType // Type of logging: "console", "file", atau "all"
+	BufferSize int     // Buffer size untuk async logging channel (default: 1000)
+}
+
+// logMessage represents a log message to be written asynchronously
+type logMessage struct {
+	level     string
+	uuid      string
+	message   string
+	args      []interface{}
+	entry     *LogEntry // For mandatory fields logging
+	formatted string    // Pre-formatted message (optional)
+	// Caller info (captured at log call time, not worker time)
+	file     string
+	line     int
+	function string
 }
 
 // Logger is the main logging structure
@@ -108,6 +124,12 @@ type Logger struct {
 	enableConsole bool
 	hostname      string
 	ipAddress     string
+
+	// Async logging
+	logChan   chan *logMessage
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closed    chan struct{}
 }
 
 // getLocalIP returns the local IP address
@@ -357,6 +379,12 @@ func StartLogger(config *LoggerConfig) (*Logger, error) {
 	enableConsole := config.Type == LogTypeConsole || config.Type == LogTypeAll
 	enableFile := config.Type == LogTypeFile || config.Type == LogTypeAll
 
+	// Set buffer size (default: 1000)
+	bufferSize := config.BufferSize
+	if bufferSize <= 0 {
+		bufferSize = 1000 // Default buffer size
+	}
+
 	logger := &Logger{
 		errorLog:      log.New(os.Stderr, "", 0),
 		warningLog:    log.New(os.Stdout, "", 0),
@@ -366,6 +394,8 @@ func StartLogger(config *LoggerConfig) (*Logger, error) {
 		enableConsole: enableConsole,
 		hostname:      getHostname(),
 		ipAddress:     getLocalIP(),
+		logChan:       make(chan *logMessage, bufferSize), // Buffered channel with configurable capacity
+		closed:        make(chan struct{}),
 	}
 
 	// Setup file logging if enabled
@@ -379,6 +409,10 @@ func StartLogger(config *LoggerConfig) (*Logger, error) {
 		logger.useFile = true
 		// File akan ditulis tanpa ANSI color codes (plain text)
 	}
+
+	// Start async worker goroutine
+	logger.wg.Add(1)
+	go logger.worker()
 
 	return logger, nil
 }
@@ -398,12 +432,98 @@ func NewLoggerSimple(logFile string) (*Logger, error) {
 	return StartLogger(config)
 }
 
-// Close closes the log file if one was opened
-func (l *Logger) Close() error {
-	if l.file != nil {
-		return l.file.Close()
+// worker is the async worker goroutine that processes log messages
+func (l *Logger) worker() {
+	defer l.wg.Done()
+
+	for {
+		select {
+		case msg := <-l.logChan:
+			if msg == nil {
+				// Channel closed, flush remaining messages
+				for {
+					select {
+					case remainingMsg := <-l.logChan:
+						if remainingMsg != nil {
+							l.writeLog(remainingMsg)
+						}
+					default:
+						return
+					}
+				}
+			}
+			l.writeLog(msg)
+		case <-l.closed:
+			// Flush remaining messages
+			for {
+				select {
+				case msg := <-l.logChan:
+					if msg != nil {
+						l.writeLog(msg)
+					}
+				default:
+					return
+				}
+			}
+		}
 	}
-	return nil
+}
+
+// writeLog writes the log message to console and/or file
+func (l *Logger) writeLog(msg *logMessage) {
+	var formatted string
+
+	if msg.formatted != "" {
+		// Use pre-formatted message
+		formatted = msg.formatted
+	} else if msg.entry != nil {
+		// Use mandatory fields format
+		formatted = l.formatMandatoryMessage(*msg.entry)
+	} else {
+		// Use standard format with caller info from message
+		formatted = l.formatMessage(msg.level, msg.uuid, msg.message, msg.file, msg.line, msg.function, msg.args...)
+	}
+
+	// Write to console if enabled (DENGAN WARNA)
+	if l.enableConsole {
+		switch msg.level {
+		case "ERROR":
+			fmt.Fprintf(os.Stderr, "\033[31m%s\033[0m\n", formatted) // Red
+		case "WARNING":
+			fmt.Fprintf(os.Stdout, "\033[33m%s\033[0m\n", formatted) // Yellow
+		case "SUCCESS":
+			fmt.Fprintf(os.Stdout, "\033[32m%s\033[0m\n", formatted) // Green
+		case "INFO":
+			fmt.Fprintf(os.Stdout, "\033[36m%s\033[0m\n", formatted) // Cyan
+		default:
+			fmt.Println(formatted)
+		}
+	}
+
+	// Write to file if enabled (TANPA WARNA - plain text)
+	if l.useFile && l.file != nil {
+		fmt.Fprintln(l.file, formatted) // Plain text, no color codes
+	}
+}
+
+// Close closes the log file and shuts down the async worker
+func (l *Logger) Close() error {
+	var err error
+
+	l.closeOnce.Do(func() {
+		// Signal worker to stop
+		close(l.closed)
+
+		// Wait for worker to finish processing remaining messages
+		l.wg.Wait()
+
+		// Close log file
+		if l.file != nil {
+			err = l.file.Close()
+		}
+	})
+
+	return err
 }
 
 // getCallerInfo returns the file, line number, and function name of the caller
@@ -433,12 +553,10 @@ func getCallerInfo(skip int) (file string, line int, function string) {
 }
 
 // formatMessage formats the log message with timestamp, level, location, IP, hostname, and UUID
-func (l *Logger) formatMessage(level string, uuid string, message string, args ...interface{}) string {
+// file, line, and function are captured at the call site (not in worker goroutine)
+func (l *Logger) formatMessage(level string, uuid string, message string, file string, line int, function string, args ...interface{}) string {
 	// Get current time with more detail
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-
-	// Get caller information (skip 3 levels: formatMessage -> writeToBoth -> Error/Warning/etc)
-	file, line, function := getCallerInfo(4)
 
 	formattedMsg := fmt.Sprintf(message, args...)
 
@@ -503,30 +621,29 @@ func (l *Logger) formatMandatoryMessage(entry LogEntry) string {
 	return strings.Join(parts, " | ")
 }
 
-// writeToBoth writes to both console and file if enabled
+// writeToBoth sends log message to async channel (non-blocking)
 func (l *Logger) writeToBoth(level string, uuid string, message string, args ...interface{}) {
-	formatted := l.formatMessage(level, uuid, message, args...)
+	// Get caller information (skip 3 levels: writeToBoth -> Error/Warning/etc -> user code)
+	file, line, function := getCallerInfo(3)
 
-	// Write to console if enabled (DENGAN WARNA)
-	if l.enableConsole {
-		switch level {
-		case "ERROR":
-			fmt.Fprintf(os.Stderr, "\033[31m%s\033[0m\n", formatted) // Red
-		case "WARNING":
-			fmt.Fprintf(os.Stdout, "\033[33m%s\033[0m\n", formatted) // Yellow
-		case "SUCCESS":
-			fmt.Fprintf(os.Stdout, "\033[32m%s\033[0m\n", formatted) // Green
-		case "INFO":
-			fmt.Fprintf(os.Stdout, "\033[36m%s\033[0m\n", formatted) // Cyan
-		default:
-			fmt.Println(formatted)
-		}
+	// Create log message with caller info
+	msg := &logMessage{
+		level:    level,
+		uuid:     uuid,
+		message:  message,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
 	}
 
-	// Write to file if enabled (TANPA WARNA - plain text)
-	// Config EnableFile menentukan apakah log ditulis ke file .log atau tidak
-	if l.useFile && l.file != nil {
-		fmt.Fprintln(l.file, formatted) // Plain text, no color codes
+	// Send to channel (non-blocking if channel is full, we'll drop the message)
+	select {
+	case l.logChan <- msg:
+		// Message sent successfully
+	default:
+		// Channel is full, log to stderr as fallback (shouldn't happen in normal operation)
+		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", message)
 	}
 }
 
@@ -552,22 +669,82 @@ func (l *Logger) Info(message string, args ...interface{}) {
 
 // Errorf logs a formatted error message
 func (l *Logger) Errorf(format string, args ...interface{}) {
-	l.Error(format, args...)
+	// Get caller information (skip 2 levels: Errorf -> user code)
+	file, line, function := getCallerInfo(2)
+	msg := &logMessage{
+		level:    "ERROR",
+		uuid:     generateUUID(),
+		message:  format,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
+	}
+	select {
+	case l.logChan <- msg:
+	default:
+		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
+	}
 }
 
 // Warningf logs a formatted warning message
 func (l *Logger) Warningf(format string, args ...interface{}) {
-	l.Warning(format, args...)
+	// Get caller information (skip 2 levels: Warningf -> user code)
+	file, line, function := getCallerInfo(2)
+	msg := &logMessage{
+		level:    "WARNING",
+		uuid:     generateUUID(),
+		message:  format,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
+	}
+	select {
+	case l.logChan <- msg:
+	default:
+		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
+	}
 }
 
 // Successf logs a formatted success message
 func (l *Logger) Successf(format string, args ...interface{}) {
-	l.Success(format, args...)
+	// Get caller information (skip 2 levels: Successf -> user code)
+	file, line, function := getCallerInfo(2)
+	msg := &logMessage{
+		level:    "SUCCESS",
+		uuid:     generateUUID(),
+		message:  format,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
+	}
+	select {
+	case l.logChan <- msg:
+	default:
+		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
+	}
 }
 
 // Infof logs a formatted info message
 func (l *Logger) Infof(format string, args ...interface{}) {
-	l.Info(format, args...)
+	// Get caller information (skip 2 levels: Infof -> user code)
+	file, line, function := getCallerInfo(2)
+	msg := &logMessage{
+		level:    "INFO",
+		uuid:     generateUUID(),
+		message:  format,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
+	}
+	select {
+	case l.logChan <- msg:
+	default:
+		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
+	}
 }
 
 // ErrorCtx logs an error message with context
@@ -650,26 +827,20 @@ func (l *Logger) LogWithMandatoryFields(ctx context.Context, level string, flag 
 
 	formatted := l.formatMandatoryMessage(entry)
 
-	// Write to console if enabled
-	if l.enableConsole {
-		switch level {
-		case "ERROR":
-			fmt.Fprintf(os.Stderr, "\033[31m%s\033[0m\n", formatted) // Red
-		case "WARNING":
-			fmt.Fprintf(os.Stdout, "\033[33m%s\033[0m\n", formatted) // Yellow
-		case "SUCCESS":
-			fmt.Fprintf(os.Stdout, "\033[32m%s\033[0m\n", formatted) // Green
-		case "INFO":
-			fmt.Fprintf(os.Stdout, "\033[36m%s\033[0m\n", formatted) // Cyan
-		default:
-			fmt.Println(formatted)
-		}
+	// Send to async channel
+	msg := &logMessage{
+		level:     level,
+		entry:     &entry,
+		formatted: formatted,
 	}
 
-	// Write to file if enabled (TANPA WARNA - plain text)
-	// Config EnableFile menentukan apakah log ditulis ke file .log atau tidak
-	if l.useFile && l.file != nil {
-		fmt.Fprintln(l.file, formatted) // Plain text, no color codes
+	// Send to channel (non-blocking if channel is full)
+	select {
+	case l.logChan <- msg:
+		// Message sent successfully
+	default:
+		// Channel is full, log to stderr as fallback
+		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", formatted)
 	}
 }
 
