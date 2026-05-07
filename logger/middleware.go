@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"sync"
-	"time"
 )
 
 // HTTPRequestInfo contains information extracted from HTTP request
@@ -108,7 +107,7 @@ func (l *Logger) StartFromHTTPRequestInfo(reqInfo HTTPRequestInfo, config StartC
 	}
 
 	// Set start time for execution time tracking
-	ctx = WithStartTime(ctx, time.Now())
+	ctx = WithStartTime(ctx, TimestampWIB())
 
 	// Set default level if not provided
 	level := config.Level

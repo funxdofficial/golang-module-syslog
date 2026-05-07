@@ -30,6 +30,30 @@ const (
 	LevelFatal
 )
 
+// jakartaTZ memuat lokasi Asia/Jakarta sekali (thread-safe). Jika gagal, dipakai UTC+7 (WIB).
+func convertWIBToJakarta() *time.Location {
+	convertWIBToJakartaLocOnce.Do(func() {
+		loc, err := time.LoadLocation("Asia/Jakarta")
+		if err != nil {
+			convertWIBToJakartaLoc = time.FixedZone("WIB", 7*3600)
+			return
+		}
+		convertWIBToJakartaLoc = loc
+	})
+	return convertWIBToJakartaLoc
+}
+
+var (
+	convertWIBToJakartaLocOnce sync.Once
+	convertWIBToJakartaLoc     *time.Location
+)
+
+// TimestampWIB mengembalikan waktu sekarang dalam zona Asia/Jakarta (cocok untuk timestamp log).
+// Instan waktu sama dengan time.Now(); Sub/Add tetap konsisten untuk durasi.
+func TimestampWIB() time.Time {
+	return time.Now().In(convertWIBToJakarta())
+}
+
 // ContextKey is a type for context keys
 type ContextKey string
 
@@ -319,7 +343,7 @@ func (l *Logger) StartFromRequest(r *http.Request, config StartConfig) context.C
 	}
 
 	// Set start time for execution time tracking
-	ctx = WithStartTime(ctx, time.Now())
+	ctx = WithStartTime(ctx, TimestampWIB())
 
 	// Set default level if not provided
 	level := config.Level
@@ -517,43 +541,196 @@ func (l *Logger) worker() {
 	}
 }
 
-// ANSI color codes per level. Hanya token [LEVEL] yang diwarnai (bukan satu baris)
-// agar isi pesan tetap netral terhadap warna terminal user.
+// ANSI: palet mirip log svc (timestamp magenta, level bervariasi, caller cyan, dll.).
 const (
-	ansiReset   = "\033[0m"
-	ansiTrace   = "\033[32m"       // Green
-	ansiDebug   = "\033[33m"       // Yellow
-	ansiInfo    = "\033[34m"       // Blue
-	ansiSuccess = "\033[32m"       // Green (alias semantik untuk SUCCESS)
-	ansiWarning = "\033[38;5;208m" // Orange (256-color)
-	ansiError   = "\033[31m"       // Red
-	ansiFatal   = "\033[38;5;88m"  // Dark red (256-color)
+	ansiReset         = "\033[0m"
+	ansiMagenta       = "\033[35m"       // timestamp [15:49:19] style
+	ansiCyan          = "\033[36m"       // caller [file:line:fn]
+	ansiBrightWhite   = "\033[97m"       // uuid / host / metadata
+	ansiTrace         = "\033[32m"       // Green
+	ansiDebug         = "\033[34m"       // Blue (seperti [DBUG] di referensi)
+	ansiInfo          = "\033[34m"       // Blue
+	ansiSuccess       = "\033[32m"       // Green (seperti [SUCS])
+	ansiWarning       = "\033[38;5;208m" // Orange (256-color)
+	ansiError         = "\033[31m"       // Red
+	ansiFatal         = "\033[38;5;88m"  // Dark red (256-color)
+	ansiFlagStartStop = "\033[33m"       // START / STOP agar sedikit menonjol
 )
 
-// colorizeLevel mewarnai token [LEVEL] di dalam formatted message sesuai
-// palet ANSI di atas. Level yang tidak dikenal akan dikembalikan apa adanya.
-func colorizeLevel(formatted, level string) string {
-	var color string
+func levelColorCode(level string) string {
 	switch level {
 	case "TRACE":
-		color = ansiTrace
+		return ansiTrace
 	case "DEBUG":
-		color = ansiDebug
+		return ansiDebug
 	case "INFO":
-		color = ansiInfo
+		return ansiInfo
 	case "SUCCESS":
-		color = ansiSuccess
+		return ansiSuccess
 	case "WARNING":
-		color = ansiWarning
+		return ansiWarning
 	case "ERROR":
-		color = ansiError
+		return ansiError
 	case "FATAL":
-		color = ansiFatal
+		return ansiFatal
 	default:
+		return ""
+	}
+}
+
+// colorizeLevel mewarnai token [LEVEL] saja (fallback bila format tidak dikenal).
+func colorizeLevel(formatted, level string) string {
+	code := levelColorCode(level)
+	if code == "" {
 		return formatted
 	}
 	token := "[" + level + "]"
-	return strings.Replace(formatted, token, color+token+ansiReset, 1)
+	return strings.Replace(formatted, token, code+token+ansiReset, 1)
+}
+
+const mandatoryFieldSep = " | "
+
+// colorizeMandatoryConsole mewarnai baris mandatory "a | b | c | ...":
+// [timestamp] magenta, [level] warna level, field [START]/[STOP] kuning,
+// token [...] berisi titik (mirip package.Func) cyan, tail hijau untuk SUCCESS.
+func colorizeMandatoryConsole(line, level string) string {
+	parts := strings.Split(line, mandatoryFieldSep)
+	if len(parts) < 2 {
+		return colorizeLevel(line, level)
+	}
+
+	var b strings.Builder
+	b.Grow(len(line) + 64)
+
+	b.WriteString(ansiMagenta)
+	b.WriteString(parts[0])
+	b.WriteString(ansiReset)
+
+	for i := 1; i < len(parts); i++ {
+		b.WriteString(mandatoryFieldSep)
+		seg := parts[i]
+		switch i {
+		case 1:
+			// [LEVEL]
+			if c := levelColorCode(level); c != "" {
+				b.WriteString(c)
+				b.WriteString(seg)
+				b.WriteString(ansiReset)
+			} else {
+				b.WriteString(seg)
+			}
+		default:
+			if seg == "[START]" || seg == "[STOP]" {
+				b.WriteString(ansiFlagStartStop)
+				b.WriteString(seg)
+				b.WriteString(ansiReset)
+				continue
+			}
+			if level == "SUCCESS" && strings.HasPrefix(seg, "→") {
+				b.WriteString(ansiSuccess)
+				b.WriteString(seg)
+				b.WriteString(ansiReset)
+				continue
+			}
+			// [package.func] / caller-like (ada titik di dalam bracket)
+			if strings.HasPrefix(seg, "[") && strings.HasSuffix(seg, "]") &&
+				strings.Contains(seg, ".") && !strings.Contains(seg, " ") {
+				b.WriteString(ansiCyan)
+				b.WriteString(seg)
+				b.WriteString(ansiReset)
+				continue
+			}
+			b.WriteString(ansiBrightWhite)
+			b.WriteString(seg)
+			b.WriteString(ansiReset)
+		}
+	}
+
+	return b.String()
+}
+
+// standardLogTimeLayout dipakai formatMessage / buildStandardLogParts (satu sumber).
+const standardLogTimeLayout = "2006-01-02 15:04:05.000"
+
+// standardLogParts menyimpan field log standar tanpa parse string (aman untuk pesan berisi "] [").
+type standardLogParts struct {
+	timestamp   string
+	level       string
+	uuid        string
+	hostAtIP    string // isi kurung ke-4: hostname@ip
+	caller      string // isi kurung ke-5: file:line:function
+	messageBody string // sisa baris setelah kurung kelima + spasi
+}
+
+func (l *Logger) buildStandardLogParts(level string, uuid string, message string, file string, line int, function string, args ...interface{}) standardLogParts {
+	if l == nil {
+		return standardLogParts{}
+	}
+	return standardLogParts{
+		timestamp:   TimestampWIB().Format(standardLogTimeLayout),
+		level:       level,
+		uuid:        uuid,
+		hostAtIP:    l.hostname + "@" + l.ipAddress,
+		caller:      fmt.Sprintf("%s:%d:%s", file, line, function),
+		messageBody: fmt.Sprintf(message, args...),
+	}
+}
+
+func (p standardLogParts) plainLine() string {
+	// Format: [timestamp] [level] [uuid] [hostname@ip] [file:line:function] message
+	return fmt.Sprintf("[%s] [%s] [%s] [%s] [%s] %s",
+		p.timestamp, p.level, p.uuid, p.hostAtIP, p.caller, p.messageBody)
+}
+
+// consoleColoredLine baris konsol dengan ANSI; isi teks sama dengan plainLine tanpa kode warna.
+func (p standardLogParts) consoleColoredLine() string {
+	var b strings.Builder
+	b.Grow(len(p.timestamp) + len(p.messageBody) + 120)
+
+	b.WriteString(ansiMagenta)
+	b.WriteByte('[')
+	b.WriteString(p.timestamp)
+	b.WriteByte(']')
+	b.WriteString(ansiReset)
+	b.WriteByte(' ')
+	if c := levelColorCode(p.level); c != "" {
+		b.WriteString(c)
+		b.WriteByte('[')
+		b.WriteString(p.level)
+		b.WriteByte(']')
+		b.WriteString(ansiReset)
+	} else {
+		b.WriteByte('[')
+		b.WriteString(p.level)
+		b.WriteByte(']')
+	}
+	b.WriteByte(' ')
+	b.WriteString(ansiBrightWhite)
+	b.WriteByte('[')
+	b.WriteString(p.uuid)
+	b.WriteByte(']')
+	b.WriteString(ansiReset)
+	b.WriteByte(' ')
+	b.WriteString(ansiBrightWhite)
+	b.WriteByte('[')
+	b.WriteString(p.hostAtIP)
+	b.WriteByte(']')
+	b.WriteString(ansiReset)
+	b.WriteByte(' ')
+	b.WriteString(ansiCyan)
+	b.WriteByte('[')
+	b.WriteString(p.caller)
+	b.WriteByte(']')
+	b.WriteString(ansiReset)
+	b.WriteByte(' ')
+	if p.level == "SUCCESS" {
+		b.WriteString(ansiSuccess)
+		b.WriteString(p.messageBody)
+		b.WriteString(ansiReset)
+	} else {
+		b.WriteString(p.messageBody)
+	}
+	return b.String()
 }
 
 // writeLog writes the log message to console and/or file
@@ -562,25 +739,31 @@ func (l *Logger) writeLog(msg *logMessage) {
 		return
 	}
 	var formatted string
+	var stdParts *standardLogParts
 
 	if msg.formatted != "" {
-		// Use pre-formatted message
 		formatted = msg.formatted
 	} else if msg.entry != nil {
-		// Use mandatory fields format
 		formatted = l.formatMandatoryMessage(*msg.entry)
 	} else {
-		// Use standard format with caller info from message
-		formatted = l.formatMessage(msg.level, msg.uuid, msg.message, msg.file, msg.line, msg.function, msg.args...)
+		p := l.buildStandardLogParts(msg.level, msg.uuid, msg.message, msg.file, msg.line, msg.function, msg.args...)
+		formatted = p.plainLine()
+		stdParts = &p
 	}
 
-	// Write to console if enabled (hanya token [LEVEL] yang diwarnai)
+	// Konsol: warna; log standar pakai part yang sama dengan plainLine (tanpa regex / parse).
 	if l.enableConsole {
 		out := os.Stdout
 		if msg.level == "ERROR" || msg.level == "FATAL" {
 			out = os.Stderr
 		}
-		fmt.Fprintln(out, colorizeLevel(formatted, msg.level))
+		var consoleLine string
+		if msg.formatted != "" || msg.entry != nil {
+			consoleLine = colorizeMandatoryConsole(formatted, msg.level)
+		} else {
+			consoleLine = stdParts.consoleColoredLine()
+		}
+		fmt.Fprintln(out, consoleLine)
 	}
 
 	// Write to file if enabled (TANPA WARNA - plain text)
@@ -659,14 +842,7 @@ func (l *Logger) formatMessage(level string, uuid string, message string, file s
 	if l == nil {
 		return ""
 	}
-	// Get current time with more detail
-	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
-
-	formattedMsg := fmt.Sprintf(message, args...)
-
-	// Format: [timestamp] [level] [uuid] [hostname@ip] [file:line:function] message
-	return fmt.Sprintf("[%s] [%s] [%s] [%s@%s] [%s:%d:%s] %s",
-		timestamp, level, uuid, l.hostname, l.ipAddress, file, line, function, formattedMsg)
+	return l.buildStandardLogParts(level, uuid, message, file, line, function, args...).plainLine()
 }
 
 // formatMandatoryMessage formats the log message with all mandatory fields in a readable format
@@ -1030,7 +1206,7 @@ func (l *Logger) LogWithMandatoryFields(ctx context.Context, level string, flag 
 	if l == nil {
 		return
 	}
-	now := time.Now()
+	now := TimestampWIB()
 	timestamp := now.Format("2006-01-02 15:04:05.000")
 
 	// Extract all values from context
@@ -1132,7 +1308,7 @@ func (l *Logger) Start(ctx context.Context, config StartConfig) context.Context 
 	}
 
 	// Set start time for execution time tracking
-	ctx = WithStartTime(ctx, time.Now())
+	ctx = WithStartTime(ctx, TimestampWIB())
 
 	// Set default level if not provided
 	level := config.Level
