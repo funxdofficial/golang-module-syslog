@@ -23,8 +23,10 @@ import (
 	"go/token"
 	"go/types"
 	"reflect"
+	"unsafe"
 
 	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/internal/aliases"
 )
 
 func SetUsesCgo(conf *types.Config) bool {
@@ -38,7 +40,8 @@ func SetUsesCgo(conf *types.Config) bool {
 		}
 	}
 
-	*(*bool)(f.Addr().UnsafePointer()) = true
+	addr := unsafe.Pointer(f.UnsafeAddr())
+	*(*bool)(addr) = true
 
 	return true
 }
@@ -141,7 +144,7 @@ var (
 func Origin(t NamedOrAlias) NamedOrAlias {
 	switch t := t.(type) {
 	case *types.Alias:
-		return t.Origin()
+		return aliases.Origin(t)
 	case *types.Named:
 		return t.Origin()
 	}
