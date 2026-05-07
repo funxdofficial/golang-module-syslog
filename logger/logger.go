@@ -591,7 +591,7 @@ func colorizeLevel(formatted, level string) string {
 const mandatoryFieldSep = " | "
 
 // colorizeMandatoryConsole mewarnai baris mandatory "a | b | c | ...":
-// [timestamp] magenta, [level] warna level, field [START]/[STOP] kuning,
+// [timestamp] magenta, [level] warna level, [START]/[STOP] kuning,
 // token [...] berisi titik (mirip package.Func) cyan, tail hijau untuk SUCCESS.
 func colorizeMandatoryConsole(line, level string) string {
 	parts := strings.Split(line, mandatoryFieldSep)
@@ -677,9 +677,15 @@ func (l *Logger) buildStandardLogParts(level string, uuid string, message string
 }
 
 func (p standardLogParts) plainLine() string {
-	// Format: [timestamp] [level] [uuid] [hostname@ip] [file:line:function] message
-	return fmt.Sprintf("[%s] [%s] [%s] [%s] [%s] %s",
-		p.timestamp, p.level, p.uuid, p.hostAtIP, p.caller, p.messageBody)
+	// Sama gaya pemisah & label seperti log mandatory (TxnID / Host / Caller).
+	return strings.Join([]string{
+		fmt.Sprintf("[%s]", p.timestamp),
+		fmt.Sprintf("[%s]", p.level),
+		fmt.Sprintf("TxnID: %s", p.uuid),
+		fmt.Sprintf("Host: %s", p.hostAtIP),
+		fmt.Sprintf("Function: %s", p.caller),
+		fmt.Sprintf("Message: %s", p.messageBody),
+	}, mandatoryFieldSep)
 }
 
 // consoleColoredLine baris konsol dengan ANSI; isi teks sama dengan plainLine tanpa kode warna.
@@ -687,12 +693,17 @@ func (p standardLogParts) consoleColoredLine() string {
 	var b strings.Builder
 	b.Grow(len(p.timestamp) + len(p.messageBody) + 120)
 
+	writeSep := func() {
+		b.WriteString(mandatoryFieldSep)
+	}
+
 	b.WriteString(ansiMagenta)
 	b.WriteByte('[')
 	b.WriteString(p.timestamp)
 	b.WriteByte(']')
 	b.WriteString(ansiReset)
-	b.WriteByte(' ')
+
+	writeSep()
 	if c := levelColorCode(p.level); c != "" {
 		b.WriteString(c)
 		b.WriteByte('[')
@@ -704,25 +715,26 @@ func (p standardLogParts) consoleColoredLine() string {
 		b.WriteString(p.level)
 		b.WriteByte(']')
 	}
-	b.WriteByte(' ')
+
+	writeSep()
 	b.WriteString(ansiBrightWhite)
-	b.WriteByte('[')
+	b.WriteString("TxnID: ")
 	b.WriteString(p.uuid)
-	b.WriteByte(']')
 	b.WriteString(ansiReset)
-	b.WriteByte(' ')
+
+	writeSep()
 	b.WriteString(ansiBrightWhite)
-	b.WriteByte('[')
+	b.WriteString("Host: ")
 	b.WriteString(p.hostAtIP)
-	b.WriteByte(']')
 	b.WriteString(ansiReset)
-	b.WriteByte(' ')
+
+	writeSep()
 	b.WriteString(ansiCyan)
-	b.WriteByte('[')
+	b.WriteString("Caller: ")
 	b.WriteString(p.caller)
-	b.WriteByte(']')
 	b.WriteString(ansiReset)
-	b.WriteByte(' ')
+
+	writeSep()
 	if p.level == "SUCCESS" {
 		b.WriteString(ansiSuccess)
 		b.WriteString(p.messageBody)
@@ -852,11 +864,9 @@ func (l *Logger) formatMandatoryMessage(entry LogEntry) string {
 	}
 	var parts []string
 
-	// Timestamp and Level
 	parts = append(parts, fmt.Sprintf("[%s]", entry.Timestamp))
 	parts = append(parts, fmt.Sprintf("[%s]", entry.LogLevel))
 
-	// Flag (START/STOP) if present
 	if entry.Flag != "" {
 		parts = append(parts, fmt.Sprintf("[%s]", entry.Flag))
 	}
