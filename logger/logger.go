@@ -882,24 +882,44 @@ func (l *Logger) InfoCtx(ctx context.Context, message string, args ...interface{
 	l.writeToBoth("INFO", uuid, message, args...)
 }
 
+// enqueueFormattedCtx mengirim log printf-style dengan UUID dari context.
+// Caller file:line diambil dari pemanggil *fCtx (bukan dari modul ini):
+// stack user -> TracefCtx -> enqueueFormattedCtx -> getCallerInfo, maka skip=3.
+func (l *Logger) enqueueFormattedCtx(ctx context.Context, level, format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+	file, line, function := getCallerInfo(3)
+	msg := &logMessage{
+		level:    level,
+		uuid:     getUUIDFromContext(ctx),
+		message:  format,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
+	}
+	_ = l.tryEnqueue(msg, format)
+}
+
 // ErrorfCtx logs a formatted error message with context
 func (l *Logger) ErrorfCtx(ctx context.Context, format string, args ...interface{}) {
-	l.ErrorCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "ERROR", format, args...)
 }
 
 // WarningfCtx logs a formatted warning message with context
 func (l *Logger) WarningfCtx(ctx context.Context, format string, args ...interface{}) {
-	l.WarningCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "WARNING", format, args...)
 }
 
 // SuccessfCtx logs a formatted success message with context
 func (l *Logger) SuccessfCtx(ctx context.Context, format string, args ...interface{}) {
-	l.SuccessCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "SUCCESS", format, args...)
 }
 
 // InfofCtx logs a formatted info message with context
 func (l *Logger) InfofCtx(ctx context.Context, format string, args ...interface{}) {
-	l.InfoCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "INFO", format, args...)
 }
 
 // sendFormatted mengirim log message yang sudah ada level + format-nya ke async channel.
@@ -947,7 +967,7 @@ func (l *Logger) TraceCtx(ctx context.Context, message string, args ...interface
 
 // TracefCtx logs a formatted trace message with context
 func (l *Logger) TracefCtx(ctx context.Context, format string, args ...interface{}) {
-	l.TraceCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "TRACE", format, args...)
 }
 
 // ========== DEBUG ==========
@@ -973,7 +993,7 @@ func (l *Logger) DebugCtx(ctx context.Context, message string, args ...interface
 
 // DebugfCtx logs a formatted debug message with context
 func (l *Logger) DebugfCtx(ctx context.Context, format string, args ...interface{}) {
-	l.DebugCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "DEBUG", format, args...)
 }
 
 // ========== FATAL ==========
@@ -1002,7 +1022,7 @@ func (l *Logger) FatalCtx(ctx context.Context, message string, args ...interface
 
 // FatalfCtx logs a formatted fatal message with context
 func (l *Logger) FatalfCtx(ctx context.Context, format string, args ...interface{}) {
-	l.FatalCtx(ctx, format, args...)
+	l.enqueueFormattedCtx(ctx, "FATAL", format, args...)
 }
 
 // LogWithMandatoryFields logs with all mandatory fields
