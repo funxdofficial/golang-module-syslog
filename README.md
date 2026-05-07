@@ -4,7 +4,7 @@ Library logging untuk Go dengan dukungan error, success, warning, dan info loggi
 
 **Fitur Utama:**
 - ✅ **Asynchronous Logging** - Non-blocking, high-performance logging dengan goroutine dan channel
-- ✅ Support multiple web framework (Gin, Echo, Fiber, standard HTTP, dll)
+- ✅ Support multiple web framework (Gin, Echo, **Fiber via `HTTPRequestInfo`**, standard HTTP, dll) — untuk Fiber tidak ada dependensi bawaan; ikuti contoh di README dan `go get` package Fiber sendiri
 - ✅ Auto-extract method dan routing dari HTTP request
 - ✅ Built-in middleware untuk standard HTTP
 - ✅ Logging ke console (dengan warna) dan file (tanpa warna) secara bersamaan
@@ -13,7 +13,7 @@ Library logging untuk Go dengan dukungan error, success, warning, dan info loggi
 ## Fitur
 
 - ✅ **Asynchronous Logging**: Non-blocking logging dengan goroutine dan buffered channel (kapasitas 1000). Semua operasi logging tidak menghambat eksekusi kode utama, meningkatkan performa aplikasi secara signifikan.
-- ✅ **Multiple Log Levels**: Error, Success, Warning, dan Info
+- ✅ **Multiple Log Levels**: `TRACE`, `DEBUG`, `INFO`, `SUCCESS`, `WARNING`, `ERROR`, `FATAL` (string level; konsol mewarnai hanya token `[LEVEL]`)
 - ✅ **UUID v7 Support**: Tracking setiap request/session dengan UUID v7 (time-based) menggunakan `github.com/google/uuid`
 - ✅ **Context Support**: Integrasi dengan `context.Context` untuk request tracing
 - ✅ **Rich Information**: Timestamp, hostname, IP address, file, line, dan function name (caller info di-capture saat pemanggilan, bukan di worker)
@@ -21,7 +21,7 @@ Library logging untuk Go dengan dukungan error, success, warning, dan info loggi
 - ✅ **File Logging**: Optional logging ke file dengan config terpisah
 - ✅ **Formatted Messages**: Support untuk formatted messages (Printf style)
 - ✅ **Auto Extract HTTP**: Otomatis extract method dan routing dari HTTP request
-- ✅ **Multi-Framework Support**: Bisa digunakan dengan berbagai web framework (Gin, Echo, Fiber, standard HTTP, dll) melalui interface `HTTPRequestInfo`
+- ✅ **Multi-Framework Support**: Bisa dipakai dengan Gin, Echo, Fiber (implementasi `HTTPRequestInfo` di aplikasi), standard HTTP, dll
 - ✅ **Built-in Middleware**: Middleware siap pakai untuk standard HTTP
 - ✅ **Mandatory Fields**: Support semua field mandatory (timestamp, level, transaction ID, service name, endpoint, method, execution time, server IP, trace ID, body, flag, message)
 - ✅ **Thread-Safe**: Aman digunakan dari multiple goroutines secara bersamaan
@@ -47,9 +47,10 @@ import (
 func main() {
     // Buat config untuk logger
     config := &logger.LoggerConfig{
-        LogFile:    "app.log",           // Path ke file log (required jika Type = "file" atau "all")
-        Type:       logger.LogTypeAll,   // Type: "console", "file", atau "all"
-        BufferSize: 1000,                // Buffer size untuk async channel (default: 1000, optional)
+        ServiceName: "my-service",        // Optional: default service untuk Start() / context bila StartConfig.ServiceName kosong
+        LogFile:     "app.log",            // Path ke file log (required jika Type = "file" atau "all")
+        Type:        logger.LogTypeAll,   // Type: "console", "file", atau "all"
+        BufferSize:  1000,                // Buffer size untuk async channel (default: 1000, optional)
     }
 
     appLogger, err := logger.StartLogger(config)
@@ -179,9 +180,10 @@ func main() {
 
 ```go
 config := &logger.LoggerConfig{
-    LogFile:    "app.log",           // Path ke file log (required jika Type = "file" atau "all")
-    Type:       logger.LogTypeAll,   // Type: "console", "file", atau "all"
-    BufferSize: 1000,                // Buffer size untuk async logging channel (default: 1000, optional)
+    ServiceName: "my-service",     // Optional: dipakai sebagai default nama service di Start() / mandatory logs
+    LogFile:     "app.log",         // Path ke file log (required jika Type = "file" atau "all")
+    Type:        logger.LogTypeAll, // Type: "console", "file", atau "all"
+    BufferSize:  1000,              // Buffer size untuk async logging channel (default: 1000, optional)
 }
 ```
 
@@ -191,9 +193,10 @@ config := &logger.LoggerConfig{
 - **`logger.LogTypeAll`** atau **`"all"`** - Console + File (console dengan warna, file tanpa warna) - **Recommended**
 
 **Field Options:**
+- **`ServiceName`** (string, optional) - Default nama service untuk `Start()` / `LogStart` ketika `StartConfig.ServiceName` kosong. Bisa juga diisi manual lewat `WithServiceName` / `StartConfig`.
 - **`LogFile`** (string, optional) - Path ke file log. Required jika `Type = "file"` atau `"all"`
 - **`Type`** (LogType, required) - Type logging: `"console"`, `"file"`, atau `"all"`
-- **`BufferSize`** (int, optional) - Buffer size untuk async logging channel. Default: `1000`. Semakin besar buffer, semakin banyak log yang bisa di-queue sebelum blocking. Untuk high-traffic aplikasi, bisa di-set lebih besar (misalnya 5000 atau 10000).
+- **`BufferSize`** (int, optional) - Buffer size untuk async logging channel. Default: `1000`. Mengatur kapasitas buffer sebelum pengiriman non-blocking di-drop (fallback ke stderr).
 
 **Contoh:**
 ```go
@@ -263,6 +266,9 @@ appLogger, err := logger.NewLoggerSimple("")        // Console only
 - `SuccessfCtx(ctx context.Context, format string, args ...interface{})` - Log formatted success dengan context
 - `InfofCtx(ctx context.Context, format string, args ...interface{})` - Log formatted info dengan context
 
+#### Level tambahan: Trace, Debug, Fatal
+Tanpa / dengan context / formatted (`Trace`, `Tracef`, `TraceCtx`, `TracefCtx`, dan setara untuk `Debug`, `Fatal`). **`Fatal` tidak memanggil `os.Exit`** — hanya menulis level `FATAL` (merah tua di konsol); hentikan proses dari aplikasi jika perlu.
+
 ### Mandatory Fields Methods
 
 - `Start(ctx context.Context, config StartConfig) context.Context` - Setup context dan log START event
@@ -272,10 +278,11 @@ appLogger, err := logger.NewLoggerSimple("")        // Console only
 - `LogStart(ctx context.Context, level string, message string, body string)` - Log START event
 - `LogStop(ctx context.Context, level string, message string, body string)` - Log STOP event
 - `LogWithBody(ctx context.Context, level string, message string, body string)` - Log dengan body
+- `LogWithMandatoryFields(ctx context.Context, level string, flag LogFlag, message string, body string)` - Satu entri lengkap mandatory fields (`Flag` boleh `""`; untuk START/STOP gunakan `LogStart` / `LogStop`)
 
 ### Middleware Methods
 
-- `StandardHTTPMiddleware(config MiddlewareConfig) func(http.Handler) http.Handler` - Built-in middleware untuk standard HTTP
+- `StandardHTTPMiddleware(config MiddlewareConfig) func(http.Handler) http.Handler` - Built-in middleware untuk standard HTTP (`MiddlewareConfig`: `ServiceName`, `SkipPaths`, `StartLevel`, `StopLevelFn`)
 
 ### Helper Functions
 
@@ -292,7 +299,7 @@ appLogger, err := logger.NewLoggerSimple("")        // Console only
 
 ## StartConfig Fields
 
-- `ServiceName` - Nama service (required)
+- `ServiceName` - Nama service (optional jika `LoggerConfig.ServiceName` sudah di-set, atau diisi kemudian via context)
 - `Endpoint` - Route/endpoint (required, atau otomatis dari HTTP request)
 - `Method` - HTTP method: GET, POST, PUT, DELETE, dll (required, atau otomatis dari HTTP request)
 - `TransactionID` - Optional, auto-generate UUID v7 jika kosong
@@ -303,12 +310,19 @@ appLogger, err := logger.NewLoggerSimple("")        // Console only
 
 ## Warna Output
 
-- **SUCCESS**: Hijau 🟢
-- **ERROR**: Merah 🔴
-- **WARNING**: Kuning 🟡
-- **INFO**: Cyan 🔵
+Hanya token **`[LEVEL]`** di konsol yang di-warna (ANSI); sisa teks baris mengikuti warna default terminal. Level **ERROR** dan **FATAL** ditulis ke **stderr**; lainnya ke **stdout**.
 
-**Note:** Console menampilkan dengan warna, file ditulis tanpa warna (plain text) untuk memudahkan parsing.
+| Level | Warna (konsol) |
+|-------|----------------|
+| **TRACE** | Hijau |
+| **DEBUG** | Kuning |
+| **INFO** | Biru |
+| **SUCCESS** | Hijau |
+| **WARNING** | Orange (ANSI 256-color; di terminal 16-warna bisa tampil mendekati) |
+| **ERROR** | Merah |
+| **FATAL** | Merah tua (ANSI 256-color) |
+
+**Note:** File log selalu **plain text** tanpa kode warna.
 
 ## Asynchronous Logging
 
@@ -319,12 +333,12 @@ Logger menggunakan **asynchronous logging** dengan goroutine dan buffered channe
 - **High Performance**: Operasi I/O (console/file) dilakukan di background, tidak menghambat eksekusi kode utama
 - **Thread-Safe**: Aman digunakan dari multiple goroutines secara bersamaan
 - **Buffered Channel**: Channel dengan kapasitas configurable (default: 1000) untuk menampung log messages. Bisa di-set melalui `LoggerConfig.BufferSize`
-- **Graceful Shutdown**: `Close()` method akan menunggu semua log yang tersisa diproses sebelum shutdown
+- **Graceful Shutdown**: `Close()` menandai shutdown (enqueue baru ditolak), men-signal worker, menunggu worker selesai, lalu **mengosongkan sisa buffer channel** sebelum menutup file
 
 ### Cara Kerja:
 1. Saat memanggil method logging (misalnya `log.Success("message")`):
    - Caller info (file, line, function) di-capture saat pemanggilan
-   - Log message dibuat dan dikirim ke buffered channel (non-blocking)
+   - Log message dibuat dan dikirim ke buffered channel (**non-blocking**: jika buffer penuh, pesan di-drop dan fallback ke stderr)
    - Method langsung return, tidak menunggu log ditulis
 
 2. Worker goroutine (background):
@@ -345,7 +359,8 @@ doSomethingImportant() // Akan langsung dieksekusi, tidak menunggu log selesai
 ```
 
 ### Important Notes:
-- **Selalu panggil `defer logger.Close()`** untuk memastikan semua log ter-flush sebelum aplikasi exit
+- **Selalu panggil `defer logger.Close()`** untuk memastikan semua log yang sudah di-queue ter-flush sebelum aplikasi exit
+- Setelah shutdown dimulai, **pemanggilan log baru tidak lagi masuk antrean** (enqueue ditolak; tidak ada blocking tunggu I/O)
 - Jika channel penuh (sangat jarang terjadi), log akan di-drop dan error message akan ditampilkan ke stderr
 - Caller info (file, line, function) di-capture saat pemanggilan method, bukan di worker goroutine, sehingga selalu akurat
 - **Buffer Size**: Default adalah 1000. Untuk aplikasi dengan traffic tinggi, bisa di-set lebih besar melalui `LoggerConfig.BufferSize` (misalnya 5000 atau 10000)
@@ -725,6 +740,36 @@ Semua field berikut akan otomatis diisi dalam setiap log entry:
 12. **Message** - Pesan log
 
 **Catatan:** Field yang tidak disediakan akan menggunakan nilai default atau di-generate otomatis.
+
+## Penyesuaian fitur: menambah & mengurangi
+
+Bagian ini menjelaskan cara **mengecilkan permukaan fitur** (lebih ringan / minim log) atau **memperluas perilaku** (integrasi, output tambahan) tanpa mengubah kontrak publik secara sembarangan.
+
+### Mengurangi fitur (lebih ringan, lebih sedikit I/O)
+
+| Kebutuhan | Cara di service / aplikasi pemanggil |
+|-----------|--------------------------------------|
+| Tanpa file di disk | Set `LoggerConfig.Type` ke `LogTypeConsole`. Jangan isi `LogFile`, atau hanya pakai mode console. |
+| Hanya file, tanpa warna di terminal | `LogTypeFile` + `LogFile` wajib. |
+| Kurangi beban memori channel | Turunkan `BufferSize` (default 1000). Ingat: channel lebih cepat penuh → lebih banyak fallback drop ke stderr. |
+| Skip route tertentu dari middleware | `MiddlewareConfig.SkipPaths` (path exact match dengan `r.URL.Path`). |
+| Kurangi log span START/STOP | Jangan pasang middleware; atau log manual tanpa `LogStart`/`LogStop`. Atur `StartLevel` ke `TRACE`/`DEBUG` dan filter di agregator log jika perlu. |
+| Tidak pakai field mandatory panjang | Pakai API sederhana: `Info`, `Error`, `Warning`, dll., bukan `Start`/`Stop`/`LogWithMandatoryFields`. |
+| Hemat caller / UUID di output | Tetap pakai API yang sama; format baris tetap mengikuti implementasi modul. Untuk format minimal, pertimbangkan wrapper aplikasi yang hanya meneruskan subset ke backend lain. |
+
+Setelah `Close()`, enqueue baru ditolak—pastikan `defer logger.Close()` di lifecycle aplikasi supaya tidak kehilangan log di akhir proses.
+
+### Menambah fitur (perluasan perilaku)
+
+| Jenis perluasan | Pendekatan yang disarankan |
+|-----------------|---------------------------|
+| Framework HTTP baru | Implementasikan `HTTPRequestInfo` lalu panggil `StartFromHTTPRequestInfo` / pola yang sama dengan contoh Gin–Echo di README. |
+| Policy level / masking | Bungkus `*logger.Logger` di struct aplikasi Anda; delegasikan ke method asli setelah memfilter atau meredaksi field. |
+| Output tambahan (Syslog, Kafka, dll.) | **Tidak ada plugin resmi.** Opsi: (1) baca file log yang ditulis modul ini dengan agen terpisah, (2) fork modul dan tambahkan penulisan di `writeLog` / worker, (3) wrapper yang menduplikasi pesan ke tujuan lain **setelah** Anda format string sendiri (duplikasi logic format). |
+| Field / format log baru | Ubah kode di `logger/logger.go` (`formatMessage`, `formatMandatoryMessage`) dan pertahankan kompatibilitas semver (bump major jika format adalah kontrak bagi konsumen). |
+| Korelasi dengan tracing eksternal | Masukkan ID lewat `context` (`WithTraceID`, `WithTransactionID`, dll.) dari instrumentation OpenTelemetry / lainnya di lapisan aplikasi. |
+
+**Prinsip:** untuk penambahan yang menyentuh **format satu baris** atau **sink I/O**, sentuh titik tunggal di worker (`writeLog` / enqueue) agar konkurensi dan `Close()` tetap konsisten.
 
 ## Performance & Best Practices
 

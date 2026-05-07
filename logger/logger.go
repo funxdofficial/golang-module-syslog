@@ -25,6 +25,9 @@ const (
 	LevelWarning
 	LevelSuccess
 	LevelInfo
+	LevelTrace
+	LevelDebug
+	LevelFatal
 )
 
 // ContextKey is a type for context keys
@@ -94,9 +97,10 @@ const (
 
 // LoggerConfig represents configuration for creating a logger instance
 type LoggerConfig struct {
-	LogFile    string  // Path to log file (required jika Type = "file" atau "all")
-	Type       LogType // Type of logging: "console", "file", atau "all"
-	BufferSize int     // Buffer size untuk async logging channel (default: 1000)
+	ServiceName string  // Nama service (dipakai sebagai default untuk StartConfig)
+	LogFile     string  // Path to log file (required jika Type = "file" atau "all")
+	Type        LogType // Type of logging: "console", "file", atau "all"
+	BufferSize  int     // Buffer size untuk async logging channel (default: 1000)
 }
 
 // logMessage represents a log message to be written asynchronously
@@ -115,21 +119,24 @@ type logMessage struct {
 
 // Logger is the main logging structure
 type Logger struct {
-	errorLog      *log.Logger
-	warningLog    *log.Logger
-	successLog    *log.Logger
-	infoLog       *log.Logger
-	file          *os.File
-	useFile       bool
-	enableConsole bool
-	hostname      string
-	ipAddress     string
+	errorLog           *log.Logger
+	warningLog         *log.Logger
+	successLog         *log.Logger
+	infoLog            *log.Logger
+	file               *os.File
+	useFile            bool
+	enableConsole      bool
+	defaultServiceName string // default dari LoggerConfig.ServiceName
+	hostname           string
+	ipAddress          string
 
 	// Async logging
-	logChan   chan *logMessage
-	wg        sync.WaitGroup
-	closeOnce sync.Once
-	closed    chan struct{}
+	logChan    chan *logMessage
+	wg         sync.WaitGroup
+	closeOnce  sync.Once
+	closed     chan struct{}
+	shutdownMu sync.Mutex // serializes enqueue vs shutdown
+	isShutdown bool       // once true, no new messages enter logChan
 }
 
 // getLocalIP returns the local IP address
@@ -140,8 +147,15 @@ func getLocalIP() string {
 	}
 	defer conn.Close()
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	addr := conn.LocalAddr()
+	if addr == nil {
+		return "unknown"
+	}
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return addr.String()
+	}
+	return udpAddr.IP.String()
 }
 
 // getHostname returns the hostname of the system
@@ -253,10 +267,11 @@ func WithHTTPRequest(ctx context.Context, r *http.Request) context.Context {
 		ctx = WithMethod(ctx, method)
 	}
 
-	// Extract endpoint/route
-	endpoint := r.URL.Path
-	if endpoint != "" {
-		ctx = WithEndpoint(ctx, endpoint)
+	// Extract endpoint/route (r.URL bisa nil pada edge case)
+	if r.URL != nil {
+		if endpoint := r.URL.Path; endpoint != "" {
+			ctx = WithEndpoint(ctx, endpoint)
+		}
 	}
 
 	return ctx
@@ -265,6 +280,9 @@ func WithHTTPRequest(ctx context.Context, r *http.Request) context.Context {
 // StartFromRequest creates context from HTTP request and logs START event
 // Ini adalah helper untuk otomatis extract method dan routing dari HTTP request
 func (l *Logger) StartFromRequest(r *http.Request, config StartConfig) context.Context {
+	if l == nil {
+		return context.Background()
+	}
 	ctx := context.Background()
 
 	// Extract method dan endpoint dari HTTP request (otomatis)
@@ -278,9 +296,13 @@ func (l *Logger) StartFromRequest(r *http.Request, config StartConfig) context.C
 		ctx = WithEndpoint(ctx, config.Endpoint)
 	}
 
-	// Set service name if provided
-	if config.ServiceName != "" {
-		ctx = WithServiceName(ctx, config.ServiceName)
+	// Set service name: dari config atau default dari LoggerConfig (satu kesatuan)
+	serviceName := config.ServiceName
+	if serviceName == "" {
+		serviceName = l.defaultServiceName
+	}
+	if serviceName != "" {
+		ctx = WithServiceName(ctx, serviceName)
 	}
 
 	// Generate or use existing UUID
@@ -370,7 +392,6 @@ func StartLogger(config *LoggerConfig) (*Logger, error) {
 		}
 	}
 
-	// Validate config
 	if (config.Type == LogTypeFile || config.Type == LogTypeAll) && config.LogFile == "" {
 		return nil, fmt.Errorf("LogFile is required when Type is 'file' or 'all'")
 	}
@@ -386,16 +407,17 @@ func StartLogger(config *LoggerConfig) (*Logger, error) {
 	}
 
 	logger := &Logger{
-		errorLog:      log.New(os.Stderr, "", 0),
-		warningLog:    log.New(os.Stdout, "", 0),
-		successLog:    log.New(os.Stdout, "", 0),
-		infoLog:       log.New(os.Stdout, "", 0),
-		useFile:       false,
-		enableConsole: enableConsole,
-		hostname:      getHostname(),
-		ipAddress:     getLocalIP(),
-		logChan:       make(chan *logMessage, bufferSize), // Buffered channel with configurable capacity
-		closed:        make(chan struct{}),
+		errorLog:           log.New(os.Stderr, "", 0),
+		warningLog:         log.New(os.Stdout, "", 0),
+		successLog:         log.New(os.Stdout, "", 0),
+		infoLog:            log.New(os.Stdout, "", 0),
+		useFile:            false,
+		enableConsole:      enableConsole,
+		defaultServiceName: config.ServiceName,
+		hostname:           getHostname(),
+		ipAddress:          getLocalIP(),
+		logChan:            make(chan *logMessage, bufferSize), // Buffered channel with configurable capacity
+		closed:             make(chan struct{}),
 	}
 
 	// Setup file logging if enabled
@@ -432,8 +454,34 @@ func NewLoggerSimple(logFile string) (*Logger, error) {
 	return StartLogger(config)
 }
 
+// tryEnqueue sends msg to the async worker. Returns false if the logger is
+// shutting down, the channel is full (message dropped), or l/msg is nil.
+// shutdownMu prevents enqueue after isShutdown while Close drains the worker.
+func (l *Logger) tryEnqueue(msg *logMessage, dropHint string) bool {
+	if l == nil || msg == nil {
+		return false
+	}
+	l.shutdownMu.Lock()
+	defer l.shutdownMu.Unlock()
+	if l.isShutdown {
+		return false
+	}
+	select {
+	case l.logChan <- msg:
+		return true
+	default:
+		if dropHint != "" {
+			fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", dropHint)
+		}
+		return false
+	}
+}
+
 // worker is the async worker goroutine that processes log messages
 func (l *Logger) worker() {
+	if l == nil {
+		return
+	}
 	defer l.wg.Done()
 
 	for {
@@ -469,8 +517,50 @@ func (l *Logger) worker() {
 	}
 }
 
+// ANSI color codes per level. Hanya token [LEVEL] yang diwarnai (bukan satu baris)
+// agar isi pesan tetap netral terhadap warna terminal user.
+const (
+	ansiReset   = "\033[0m"
+	ansiTrace   = "\033[32m"       // Green
+	ansiDebug   = "\033[33m"       // Yellow
+	ansiInfo    = "\033[34m"       // Blue
+	ansiSuccess = "\033[32m"       // Green (alias semantik untuk SUCCESS)
+	ansiWarning = "\033[38;5;208m" // Orange (256-color)
+	ansiError   = "\033[31m"       // Red
+	ansiFatal   = "\033[38;5;88m"  // Dark red (256-color)
+)
+
+// colorizeLevel mewarnai token [LEVEL] di dalam formatted message sesuai
+// palet ANSI di atas. Level yang tidak dikenal akan dikembalikan apa adanya.
+func colorizeLevel(formatted, level string) string {
+	var color string
+	switch level {
+	case "TRACE":
+		color = ansiTrace
+	case "DEBUG":
+		color = ansiDebug
+	case "INFO":
+		color = ansiInfo
+	case "SUCCESS":
+		color = ansiSuccess
+	case "WARNING":
+		color = ansiWarning
+	case "ERROR":
+		color = ansiError
+	case "FATAL":
+		color = ansiFatal
+	default:
+		return formatted
+	}
+	token := "[" + level + "]"
+	return strings.Replace(formatted, token, color+token+ansiReset, 1)
+}
+
 // writeLog writes the log message to console and/or file
 func (l *Logger) writeLog(msg *logMessage) {
+	if msg == nil {
+		return
+	}
 	var formatted string
 
 	if msg.formatted != "" {
@@ -484,20 +574,13 @@ func (l *Logger) writeLog(msg *logMessage) {
 		formatted = l.formatMessage(msg.level, msg.uuid, msg.message, msg.file, msg.line, msg.function, msg.args...)
 	}
 
-	// Write to console if enabled (DENGAN WARNA)
+	// Write to console if enabled (hanya token [LEVEL] yang diwarnai)
 	if l.enableConsole {
-		switch msg.level {
-		case "ERROR":
-			fmt.Fprintf(os.Stderr, "\033[31m%s\033[0m\n", formatted) // Red
-		case "WARNING":
-			fmt.Fprintf(os.Stdout, "\033[33m%s\033[0m\n", formatted) // Yellow
-		case "SUCCESS":
-			fmt.Fprintf(os.Stdout, "\033[32m%s\033[0m\n", formatted) // Green
-		case "INFO":
-			fmt.Fprintf(os.Stdout, "\033[36m%s\033[0m\n", formatted) // Cyan
-		default:
-			fmt.Println(formatted)
+		out := os.Stdout
+		if msg.level == "ERROR" || msg.level == "FATAL" {
+			out = os.Stderr
 		}
+		fmt.Fprintln(out, colorizeLevel(formatted, msg.level))
 	}
 
 	// Write to file if enabled (TANPA WARNA - plain text)
@@ -508,16 +591,34 @@ func (l *Logger) writeLog(msg *logMessage) {
 
 // Close closes the log file and shuts down the async worker
 func (l *Logger) Close() error {
+	if l == nil {
+		return nil
+	}
 	var err error
 
 	l.closeOnce.Do(func() {
-		// Signal worker to stop
-		close(l.closed)
+		l.shutdownMu.Lock()
+		l.isShutdown = true
+		l.shutdownMu.Unlock()
 
-		// Wait for worker to finish processing remaining messages
+		if l.closed != nil {
+			close(l.closed)
+		}
+
 		l.wg.Wait()
 
-		// Close log file
+		for {
+			select {
+			case msg := <-l.logChan:
+				if msg != nil {
+					l.writeLog(msg)
+				}
+			default:
+				goto drained
+			}
+		}
+	drained:
+
 		if l.file != nil {
 			err = l.file.Close()
 		}
@@ -555,6 +656,9 @@ func getCallerInfo(skip int) (file string, line int, function string) {
 // formatMessage formats the log message with timestamp, level, location, IP, hostname, and UUID
 // file, line, and function are captured at the call site (not in worker goroutine)
 func (l *Logger) formatMessage(level string, uuid string, message string, file string, line int, function string, args ...interface{}) string {
+	if l == nil {
+		return ""
+	}
 	// Get current time with more detail
 	timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 
@@ -567,6 +671,9 @@ func (l *Logger) formatMessage(level string, uuid string, message string, file s
 
 // formatMandatoryMessage formats the log message with all mandatory fields in a readable format
 func (l *Logger) formatMandatoryMessage(entry LogEntry) string {
+	if l == nil {
+		return ""
+	}
 	var parts []string
 
 	// Timestamp and Level
@@ -623,6 +730,9 @@ func (l *Logger) formatMandatoryMessage(entry LogEntry) string {
 
 // writeToBoth sends log message to async channel (non-blocking)
 func (l *Logger) writeToBoth(level string, uuid string, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	// Get caller information (skip 3 levels: writeToBoth -> Error/Warning/etc -> user code)
 	file, line, function := getCallerInfo(3)
 
@@ -637,14 +747,7 @@ func (l *Logger) writeToBoth(level string, uuid string, message string, args ...
 		function: function,
 	}
 
-	// Send to channel (non-blocking if channel is full, we'll drop the message)
-	select {
-	case l.logChan <- msg:
-		// Message sent successfully
-	default:
-		// Channel is full, log to stderr as fallback (shouldn't happen in normal operation)
-		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", message)
-	}
+	_ = l.tryEnqueue(msg, message)
 }
 
 // Error logs an error message
@@ -669,6 +772,9 @@ func (l *Logger) Info(message string, args ...interface{}) {
 
 // Errorf logs a formatted error message
 func (l *Logger) Errorf(format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	// Get caller information (skip 2 levels: Errorf -> user code)
 	file, line, function := getCallerInfo(2)
 	msg := &logMessage{
@@ -680,15 +786,14 @@ func (l *Logger) Errorf(format string, args ...interface{}) {
 		line:     line,
 		function: function,
 	}
-	select {
-	case l.logChan <- msg:
-	default:
-		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
-	}
+	_ = l.tryEnqueue(msg, format)
 }
 
 // Warningf logs a formatted warning message
 func (l *Logger) Warningf(format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	// Get caller information (skip 2 levels: Warningf -> user code)
 	file, line, function := getCallerInfo(2)
 	msg := &logMessage{
@@ -700,15 +805,14 @@ func (l *Logger) Warningf(format string, args ...interface{}) {
 		line:     line,
 		function: function,
 	}
-	select {
-	case l.logChan <- msg:
-	default:
-		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
-	}
+	_ = l.tryEnqueue(msg, format)
 }
 
 // Successf logs a formatted success message
 func (l *Logger) Successf(format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	// Get caller information (skip 2 levels: Successf -> user code)
 	file, line, function := getCallerInfo(2)
 	msg := &logMessage{
@@ -720,15 +824,14 @@ func (l *Logger) Successf(format string, args ...interface{}) {
 		line:     line,
 		function: function,
 	}
-	select {
-	case l.logChan <- msg:
-	default:
-		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
-	}
+	_ = l.tryEnqueue(msg, format)
 }
 
 // Infof logs a formatted info message
 func (l *Logger) Infof(format string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	// Get caller information (skip 2 levels: Infof -> user code)
 	file, line, function := getCallerInfo(2)
 	msg := &logMessage{
@@ -740,33 +843,41 @@ func (l *Logger) Infof(format string, args ...interface{}) {
 		line:     line,
 		function: function,
 	}
-	select {
-	case l.logChan <- msg:
-	default:
-		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", format)
-	}
+	_ = l.tryEnqueue(msg, format)
 }
 
 // ErrorCtx logs an error message with context
 func (l *Logger) ErrorCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	uuid := getUUIDFromContext(ctx)
 	l.writeToBoth("ERROR", uuid, message, args...)
 }
 
 // WarningCtx logs a warning message with context
 func (l *Logger) WarningCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	uuid := getUUIDFromContext(ctx)
 	l.writeToBoth("WARNING", uuid, message, args...)
 }
 
 // SuccessCtx logs a success message with context
 func (l *Logger) SuccessCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	uuid := getUUIDFromContext(ctx)
 	l.writeToBoth("SUCCESS", uuid, message, args...)
 }
 
 // InfoCtx logs an info message with context
 func (l *Logger) InfoCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
 	uuid := getUUIDFromContext(ctx)
 	l.writeToBoth("INFO", uuid, message, args...)
 }
@@ -791,8 +902,114 @@ func (l *Logger) InfofCtx(ctx context.Context, format string, args ...interface{
 	l.InfoCtx(ctx, format, args...)
 }
 
+// sendFormatted mengirim log message yang sudah ada level + format-nya ke async channel.
+// Dipakai oleh varian *f (Tracef/Debugf/Fatalf) untuk menghindari duplikasi boilerplate.
+// callerSkip = jumlah frame yang harus dilewati runtime.Caller agar caller info menunjuk ke
+// kode user (umumnya 2: sendFormatted -> Levelf -> user).
+func (l *Logger) sendFormatted(level, format string, callerSkip int, args ...interface{}) {
+	if l == nil {
+		return
+	}
+	file, line, function := getCallerInfo(callerSkip)
+	msg := &logMessage{
+		level:    level,
+		uuid:     generateUUID(),
+		message:  format,
+		args:     args,
+		file:     file,
+		line:     line,
+		function: function,
+	}
+	_ = l.tryEnqueue(msg, format)
+}
+
+// ========== TRACE ==========
+
+// Trace logs a trace message (lowest verbosity, untuk diagnostik mendetail)
+func (l *Logger) Trace(message string, args ...interface{}) {
+	l.writeToBoth("TRACE", generateUUID(), message, args...)
+}
+
+// Tracef logs a formatted trace message
+func (l *Logger) Tracef(format string, args ...interface{}) {
+	// skip 2: Tracef -> user
+	l.sendFormatted("TRACE", format, 2, args...)
+}
+
+// TraceCtx logs a trace message with context
+func (l *Logger) TraceCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+	uuid := getUUIDFromContext(ctx)
+	l.writeToBoth("TRACE", uuid, message, args...)
+}
+
+// TracefCtx logs a formatted trace message with context
+func (l *Logger) TracefCtx(ctx context.Context, format string, args ...interface{}) {
+	l.TraceCtx(ctx, format, args...)
+}
+
+// ========== DEBUG ==========
+
+// Debug logs a debug message (verbose, untuk pengembangan)
+func (l *Logger) Debug(message string, args ...interface{}) {
+	l.writeToBoth("DEBUG", generateUUID(), message, args...)
+}
+
+// Debugf logs a formatted debug message
+func (l *Logger) Debugf(format string, args ...interface{}) {
+	l.sendFormatted("DEBUG", format, 2, args...)
+}
+
+// DebugCtx logs a debug message with context
+func (l *Logger) DebugCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+	uuid := getUUIDFromContext(ctx)
+	l.writeToBoth("DEBUG", uuid, message, args...)
+}
+
+// DebugfCtx logs a formatted debug message with context
+func (l *Logger) DebugfCtx(ctx context.Context, format string, args ...interface{}) {
+	l.DebugCtx(ctx, format, args...)
+}
+
+// ========== FATAL ==========
+// Catatan: Fatal hanya menulis log dengan level FATAL; method ini TIDAK
+// memanggil os.Exit. Pemanggil yang ingin menghentikan program bisa
+// melakukannya sendiri setelah memanggil Fatal/Fatalf.
+
+// Fatal logs a fatal message (severitas tertinggi)
+func (l *Logger) Fatal(message string, args ...interface{}) {
+	l.writeToBoth("FATAL", generateUUID(), message, args...)
+}
+
+// Fatalf logs a formatted fatal message
+func (l *Logger) Fatalf(format string, args ...interface{}) {
+	l.sendFormatted("FATAL", format, 2, args...)
+}
+
+// FatalCtx logs a fatal message with context
+func (l *Logger) FatalCtx(ctx context.Context, message string, args ...interface{}) {
+	if l == nil {
+		return
+	}
+	uuid := getUUIDFromContext(ctx)
+	l.writeToBoth("FATAL", uuid, message, args...)
+}
+
+// FatalfCtx logs a formatted fatal message with context
+func (l *Logger) FatalfCtx(ctx context.Context, format string, args ...interface{}) {
+	l.FatalCtx(ctx, format, args...)
+}
+
 // LogWithMandatoryFields logs with all mandatory fields
 func (l *Logger) LogWithMandatoryFields(ctx context.Context, level string, flag LogFlag, message string, body string) {
+	if l == nil {
+		return
+	}
 	now := time.Now()
 	timestamp := now.Format("2006-01-02 15:04:05.000")
 
@@ -825,22 +1042,15 @@ func (l *Logger) LogWithMandatoryFields(ctx context.Context, level string, flag 
 		Message:       message,
 	}
 
-	formatted := l.formatMandatoryMessage(entry)
-
-	// Send to async channel
-	msg := &logMessage{
-		level:     level,
-		entry:     &entry,
-		formatted: formatted,
-	}
-
-	// Send to channel (non-blocking if channel is full)
-	select {
-	case l.logChan <- msg:
-		// Message sent successfully
-	default:
-		// Channel is full, log to stderr as fallback
-		fmt.Fprintf(os.Stderr, "[LOGGER ERROR] Log channel is full, dropping message: %s\n", formatted)
+	// Kirim ke console/file bila diaktifkan
+	if l.enableConsole || l.useFile {
+		formatted := l.formatMandatoryMessage(entry)
+		msg := &logMessage{
+			level:     level,
+			entry:     &entry,
+			formatted: formatted,
+		}
+		_ = l.tryEnqueue(msg, formatted)
 	}
 }
 
@@ -862,9 +1072,11 @@ func (l *Logger) LogWithBody(ctx context.Context, level string, message string, 
 // Start creates a new context with all configuration and logs a START event
 // This is a convenience method that sets up everything in one call
 func (l *Logger) Start(ctx context.Context, config StartConfig) context.Context {
-	// If no context provided, create new one
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if l == nil {
+		return ctx
 	}
 
 	// Generate or use existing UUID
@@ -875,9 +1087,13 @@ func (l *Logger) Start(ctx context.Context, config StartConfig) context.Context 
 		ctx = WithTransactionID(ctx, config.TransactionID)
 	}
 
-	// Set service name if provided
-	if config.ServiceName != "" {
-		ctx = WithServiceName(ctx, config.ServiceName)
+	// Set service name: dari StartConfig atau default dari LoggerConfig (satu kesatuan)
+	serviceName := config.ServiceName
+	if serviceName == "" {
+		serviceName = l.defaultServiceName
+	}
+	if serviceName != "" {
+		ctx = WithServiceName(ctx, serviceName)
 	}
 
 	// Set endpoint if provided
@@ -918,6 +1134,9 @@ func (l *Logger) Start(ctx context.Context, config StartConfig) context.Context 
 
 // Stop logs a STOP event using the context from Start
 func (l *Logger) Stop(ctx context.Context, level string, message string, body string) {
+	if l == nil {
+		return
+	}
 	if message == "" {
 		message = "Request completed"
 	}
